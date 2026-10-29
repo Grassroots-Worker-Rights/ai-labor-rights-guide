@@ -29,7 +29,7 @@ class SeoControllerTest {
     }
 
     @Test
-    void articleSeoPreviewReturnsHtmlWithOpenGraphAndCanonical() {
+    void articleSeoPreviewReturnsFullSemanticHtmlAndResolvedLinks() {
         WikiService wikiService = new WikiService();
         SeoController controller = new SeoController(wikiService, "https://ergasiakos-odigos.gr");
 
@@ -42,6 +42,12 @@ class SeoControllerTest {
         assertTrue(html.contains("rel=\"canonical\" href=\"https://ergasiakos-odigos.gr/wiki/adeies/adia-gamos.md\""));
         assertTrue(html.contains("property=\"og:title\" content=\"Άδεια Γάμου &amp; Τεκνοποίησης — Εργασιακός Οδηγός Βάσης\""));
         assertTrue(html.contains("property=\"og:description\" content=\"Αν παντρεύεσαι ή συνάπτεις σύμφωνο συμβίωσης"));
+        assertTrue(html.contains("<script type=\"application/ld+json\">"));
+        assertTrue(html.contains("\"@type\":\"Article\""));
+        assertTrue(html.contains("<h1>Άδεια Γάμου &amp; Τεκνοποίησης</h1>"));
+        assertTrue(html.contains("<h2>Άδεια γάμου / συμφώνου συμβίωσης</h2>"));
+        assertTrue(html.contains("<table>"));
+        assertTrue(html.contains("<a href=\"/wiki/adeies/etisia-adia.md\">Ετήσια Άδεια</a>"));
     }
 
     @Test
