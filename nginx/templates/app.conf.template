@@ -99,10 +99,34 @@ server {
         proxy_read_timeout  200s;   # multi-step LLM turns (search_articles -> get_article -> answer) can be slow
     }
 
-    # ── Angular SPA ─────────────────────────────────────────────────────
+    # ── Dynamic XML Sitemap (backed by WikiService, cached for 24 h) ────
+    location = /sitemap.xml {
+        proxy_pass          http://backend:8080/sitemap.xml;
+        proxy_http_version  1.1;
+        proxy_set_header    Host              $host;
+        proxy_set_header    X-Real-IP         $remote_addr;
+        proxy_set_header    X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header    X-Forwarded-Proto $scheme;
+
+        proxy_cache             wiki_cache;
+        proxy_cache_valid       200 24h;
+        proxy_cache_use_stale   error timeout updating http_500 http_502 http_503 http_504;
+        proxy_cache_background_update on;
+        proxy_cache_lock        on;
+
+        add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+        add_header X-Frame-Options DENY always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header X-XSS-Protection "1; mode=block" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header X-Cache-Status $upstream_cache_status always;
+    }
+
+    # ── Angular SPA (frontend nginx also routes social bots on /wiki/* to backend) ──
     location / {
         proxy_pass       http://frontend:80;
         proxy_set_header Host              $host;
+        proxy_set_header User-Agent        $http_user_agent;
         proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto $scheme;
 
