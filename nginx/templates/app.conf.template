@@ -6,6 +6,7 @@ server {
     listen 80;
     listen [::]:80;
     server_name ${DOMAIN};
+    access_log off;
 
     location /.well-known/acme-challenge/ {
         root /var/www/certbot;
@@ -30,6 +31,10 @@ server {
     listen [::]:443 ssl http2;
     server_name ${DOMAIN};
 
+    # Privacy: do not record visitor IPs or browsed URLs in nginx access logs.
+    # Rate limiting uses X-Real-IP / X-Forwarded-For in backend RAM and is unaffected.
+    access_log off;
+
     ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
     include             /etc/letsencrypt/options-ssl-nginx.conf;
@@ -40,7 +45,7 @@ server {
     add_header X-Frame-Options DENY always;
     add_header X-Content-Type-Options nosniff always;
     add_header X-XSS-Protection "1; mode=block" always;
-    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Referrer-Policy "same-origin" always;
 
     # Compress text responses at the edge (markdown articles, JSON, JS/CSS proxied from the frontend).
     # Already-compressed types (images, woff2) are skipped. Covers every upstream in one place.
@@ -78,7 +83,7 @@ server {
         add_header X-Frame-Options DENY always;
         add_header X-Content-Type-Options nosniff always;
         add_header X-XSS-Protection "1; mode=block" always;
-        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Referrer-Policy "same-origin" always;
         add_header X-Cache-Status $upstream_cache_status always;
     }
 
@@ -118,7 +123,7 @@ server {
         add_header X-Frame-Options DENY always;
         add_header X-Content-Type-Options nosniff always;
         add_header X-XSS-Protection "1; mode=block" always;
-        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Referrer-Policy "same-origin" always;
         add_header X-Cache-Status $upstream_cache_status always;
     }
 
@@ -136,7 +141,7 @@ server {
         add_header X-Frame-Options DENY always;
         add_header X-Content-Type-Options nosniff always;
         add_header X-XSS-Protection "1; mode=block" always;
-        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Referrer-Policy "same-origin" always;
     }
 
     # Meilisearch (7700) is intentionally NOT proxied — internal network only.
