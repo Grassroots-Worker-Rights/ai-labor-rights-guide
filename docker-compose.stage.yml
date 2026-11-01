@@ -1,0 +1,94 @@
+name: ai-labor-rights-stage
+
+# Stage stack (image-based), on the same server and in the same directory as prod, but a separate
+# compose project with its own volumes. Deployed by .github/workflows/deploy.yml. See docs/CICD.md.
+#
+# No nginx/certbot here and no published ports: prod's nginx terminates TLS for ${STAGE_DOMAIN}
+# (same certificate as prod) and proxies to stage-backend / stage-frontend over the shared
+# "ai-labor-rights-edge" network. Services are prefixed "stage-" so their names can never collide
+# with prod's "backend"/"frontend" on that shared network.
+#
+# Server-side (persistent, not shipped by CI): .env.stage, models/ (shared, read-only).
+#
+# Manual use on the server:
+#   export BACKEND_IMAGE_TAG=sha-1a2b3c4 FRONTEND_IMAGE_TAG=sha-5d6e7f8   # default: latest
+#   docker compose -f docker-compose.stage.yml --env-file .env.stage up -d
+#
+# Memory: stage runs next to prod on one box, so its limits are deliberately smaller than prod's.
+
+services:
+  meilisearch:
+    image: getmeili/meilisearch:v1.12
+    environment:
+      MEILI_MASTER_KEY: ${MEILI_MASTER_KEY}
+      MEILI_NO_ANALYTICS: "true"
+    volumes:
+      - meili_data:/meili_data
+    networks: [internal]
+    restart: unless-stopped
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  chromadb:
+    image: chromadb/chroma:0.6.3
+    environment:
+      IS_PERSISTENT: "TRUE"
+    volumes:
+      - chroma_data:/chroma/chroma
+    networks: [internal]
+    restart: unless-stopped
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v2/heartbeat')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  stage-backend:
+    image: ghcr.io/${IMAGE_NAMESPACE:-grassroots-worker-rights}/ai-labor-rights-backend:${BACKEND_IMAGE_TAG:-latest}
+    environment:
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
+      MEILISEARCH_URL: http://meilisearch:7700
+      MEILISEARCH_KEY: ${MEILI_MASTER_KEY}
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
+      APP_RAG_PROVIDER: ${APP_RAG_PROVIDER:-meili}
+      APP_RATELIMIT_ENABLED: ${APP_RATELIMIT_ENABLED:-true}
+      CHROMA_HOST: http://chromadb
+      CHROMA_PORT: "8000"
+    volumes:
+      - ./models:/app/models:ro
+    depends_on:
+      meilisearch:
+        condition: service_healthy
+      chromadb:
+        condition: service_started
+    networks:
+      internal:
+        # The frontend image's nginx.conf proxies /api to "backend:8080" — keep that name resolvable
+        # inside this project only.
+        aliases: [backend]
+      edge: {}
+    restart: unless-stopped
+    mem_limit: 1536m
+
+  stage-frontend:
+    image: ghcr.io/${IMAGE_NAMESPACE:-grassroots-worker-rights}/ai-labor-rights-frontend:${FRONTEND_IMAGE_TAG:-latest}
+    networks: [internal, edge]
+    depends_on: [stage-backend]
+    restart: unless-stopped
+    mem_limit: 128m
+
+networks:
+  internal:
+    driver: bridge
+  edge:
+    name: ai-labor-rights-edge
+    external: true
+
+volumes:
+  meili_data:
+  chroma_data:

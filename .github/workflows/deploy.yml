@@ -1,0 +1,156 @@
+name: Deploy
+
+# Manual deploy of already-built GHCR images to stage or prod (same server, separate compose projects).
+# Nothing is built here and the server has no git checkout: the compose file (and, for prod, the nginx
+# templates + init-ssl script) are copied over on every run. Persistent server-side state — .env files,
+# models/, certbot/ — is never touched. See docs/CICD.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        type: choice
+        options: [ stage, prod ]
+        default: stage
+      backend_tag:
+        description: 'Backend image tag. prod: vX.Y.Z only. stage: also sha-1a2b3c4 or dev-<branch>[-<sha>]. Empty = latest release.'
+        required: false
+        default: ''
+      frontend_tag:
+        description: 'Frontend image tag. prod: vX.Y.Z only. stage: also sha-1a2b3c4 or dev-<branch>[-<sha>]. Empty = latest release.'
+        required: false
+        default: ''
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAMESPACE: ${{ vars.IMAGE_NAMESPACE || 'grassroots-worker-rights' }}
+  FRONTEND_REPO: ${{ vars.FRONTEND_REPO || format('{0}/Angular-frontend', github.repository_owner) }}
+  APP_DIR: /opt/apps/ai-labor-rights
+
+jobs:
+  deploy:
+    name: Deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-latest
+    # GitHub Environment: add a required reviewer on "prod" to gate production deploys.
+    environment: ${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve & verify image tags
+        id: tags
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BACKEND_TAG: ${{ inputs.backend_tag }}
+          FRONTEND_TAG: ${{ inputs.frontend_tag }}
+        run: |
+          set -euo pipefail
+          latest_release() { gh release view --repo "$1" --json tagName --jq .tagName; }
+
+          backend="${BACKEND_TAG:-$(latest_release "$GITHUB_REPOSITORY")}"
+          frontend="${FRONTEND_TAG:-$(latest_release "$FRONTEND_REPO")}"
+
+          for tag in "$backend" "$frontend"; do
+            if ! [[ "$tag" =~ ^[A-Za-z0-9._-]+$ ]]; then
+              echo "::error::Invalid image tag: '$tag'"; exit 1
+            fi
+            # Prod runs released images only. dev-* (manual branch builds) and sha-* are stage-only.
+            if [ "${{ inputs.environment }}" = "prod" ] && ! [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+              echo "::error::Prod accepts only release tags (vX.Y.Z), got '$tag'. Deploy it to stage instead."; exit 1
+            fi
+          done
+
+          # Images are public, so an anonymous manifest lookup proves the server will be able to pull.
+          for ref in "ghcr.io/$IMAGE_NAMESPACE/ai-labor-rights-backend:$backend" \
+                     "ghcr.io/$IMAGE_NAMESPACE/ai-labor-rights-frontend:$frontend"; do
+            docker manifest inspect "$ref" > /dev/null \
+              || { echo "::error::Image not found or not public: $ref"; exit 1; }
+          done
+
+          echo "backend=$backend" >> "$GITHUB_OUTPUT"
+          echo "frontend=$frontend" >> "$GITHUB_OUTPUT"
+          echo "### Deploying to \`${{ inputs.environment }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- backend: \`$backend\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- frontend: \`$frontend\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Select files to ship
+        id: files
+        run: |
+          if [ "${{ inputs.environment }}" = "prod" ]; then
+            # Prod owns the edge nginx (TLS for both domains), so it ships the nginx templates too.
+            echo "source=docker-compose.prod.yml,nginx/templates/*,scripts/init-ssl.sh" >> "$GITHUB_OUTPUT"
+          else
+            echo "source=docker-compose.stage.yml" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Copy deployment files to server
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          source: ${{ steps.files.outputs.source }}
+          target: ${{ env.APP_DIR }}
+
+      - name: Pull & restart over SSH
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          DEPLOY_ENV: ${{ inputs.environment }}
+          BACKEND_IMAGE_TAG: ${{ steps.tags.outputs.backend }}
+          FRONTEND_IMAGE_TAG: ${{ steps.tags.outputs.frontend }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          password: ${{ secrets.SSH_PASSWORD }}
+          port: ${{ secrets.SSH_PORT || 22 }}
+          envs: APP_DIR,IMAGE_NAMESPACE,DEPLOY_ENV,BACKEND_IMAGE_TAG,FRONTEND_IMAGE_TAG
+          script: |
+            set -euo pipefail
+            cd "$APP_DIR"
+            export IMAGE_NAMESPACE BACKEND_IMAGE_TAG FRONTEND_IMAGE_TAG
+
+            if [ "$DEPLOY_ENV" = "prod" ]; then
+              ENV_FILE=.env
+              BACKEND_SVC=backend
+            else
+              ENV_FILE=.env.stage
+              BACKEND_SVC=stage-backend
+            fi
+            COMPOSE="docker compose -f docker-compose.$DEPLOY_ENV.yml --env-file $ENV_FILE"
+
+            # Shared network: prod's nginx reaches the stage containers through it.
+            docker network inspect ai-labor-rights-edge > /dev/null 2>&1 \
+              || docker network create ai-labor-rights-edge
+
+            $COMPOSE pull
+            $COMPOSE up -d --remove-orphans
+
+            if [ "$DEPLOY_ENV" = "prod" ]; then
+              # Re-render the nginx templates and re-resolve the recreated backend/frontend IPs.
+              $COMPOSE restart nginx
+            fi
+
+            # Wait for the backend to answer (startup loads the embedding model; allow ~3 min).
+            # Probed from the meilisearch container, which has curl and sits on the same network.
+            for i in $(seq 1 36); do
+              if $COMPOSE exec -T meilisearch curl -fsS -o /dev/null http://backend:8080/api/wiki/index; then
+                echo "Backend healthy after $((i * 5))s"
+                $COMPOSE ps
+                docker image prune -f > /dev/null
+                exit 0
+              fi
+              sleep 5
+            done
+
+            echo "Backend did not become healthy in time. Last logs:"
+            $COMPOSE logs --tail=100 "$BACKEND_SVC"
+            exit 1

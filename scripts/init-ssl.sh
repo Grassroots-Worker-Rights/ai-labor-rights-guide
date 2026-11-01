@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # init-ssl.sh — First-run Let's Encrypt setup for the production stack.
 #
-# Run ONCE before starting docker-compose.prod.yml for the first time:
+# Issues ONE certificate (named after $DOMAIN) covering $DOMAIN and, if set, $STAGE_DOMAIN. Prod's
+# nginx serves both sites with it. Run ONCE on the server, from /opt/apps/ai-labor-rights (the deploy
+# workflow copies this script to scripts/ there):
 #   bash scripts/init-ssl.sh
+#
+# Already have a prod-only certificate and just want to add the stage name? Don't run this script —
+# see "Add the stage domain to the existing certificate" in docs/CICD.md.
 #
 # Subsequent renewals are handled automatically by the certbot service.
 # Force-renew if ever needed:
@@ -29,7 +34,14 @@ if [ -z "$EMAIL" ]; then
   exit 1
 fi
 
-COMPOSE="docker compose -f docker-compose.prod.yml"
+STAGE_DOMAIN="${STAGE_DOMAIN:-}"
+DOMAIN_ARGS="-d $DOMAIN${STAGE_DOMAIN:+ -d $STAGE_DOMAIN}"
+
+COMPOSE="docker compose -f docker-compose.prod.yml --env-file .env"
+
+# Shared network between the prod and stage stacks (declared external in both compose files).
+docker network inspect ai-labor-rights-edge > /dev/null 2>&1 || docker network create ai-labor-rights-edge
+
 CERT_DIR="./certbot/conf"
 LIVE_DIR="$CERT_DIR/live/$DOMAIN"
 WWW_DIR="./certbot/www"
@@ -73,7 +85,7 @@ $COMPOSE run --rm --entrypoint "
          /etc/letsencrypt/archive/$DOMAIN \
          /etc/letsencrypt/renewal/$DOMAIN.conf" certbot
 
-echo "Requesting Let's Encrypt certificate for $DOMAIN (email: $EMAIL)..."
+echo "Requesting Let's Encrypt certificate for: $DOMAIN_ARGS (email: $EMAIL)..."
 $COMPOSE run --rm --entrypoint "
   certbot certonly \
     --webroot -w /var/www/certbot \
@@ -81,7 +93,8 @@ $COMPOSE run --rm --entrypoint "
     --agree-tos \
     --no-eff-email \
     --rsa-key-size 4096 \
-    -d $DOMAIN" certbot
+    --cert-name $DOMAIN \
+    $DOMAIN_ARGS" certbot
 
 # Step 5: Reload nginx with the real cert
 echo "Reloading nginx..."

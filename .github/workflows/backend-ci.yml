@@ -1,123 +1,198 @@
 name: Backend CI
 
+# Image: ghcr.io/<IMAGE_NAMESPACE>/ai-labor-rights-backend
+#
+#   push to master          → test, build & push, release if the version bumps
+#                             tags: sha-<short>, plus vX.Y.Z + latest on a release
+#   pull request to master  → test only (no image)
+#   manual run, master      → same as a push to master
+#   manual run, any branch  → test, build & push a TEST image (never a release)
+#                             tags: dev-<branch>-<short>   (exact commit)
+#                                   dev-<branch>           (moves with the branch)
+#
+# Only vX.Y.Z images are prod-ready; the deploy workflow refuses anything else for prod.
+# The git tag + GitHub Release are created only AFTER the image is pushed, so a release always has
+# an image. The deploy workflow resolves "latest release" from these GitHub Releases.
+#
+# Note: the "Run workflow" button only appears once this file exists on master.
+
 on:
-  # Auto-trigger on push to main
   push:
-    branches: [ main ]
+    branches: [ master ]
     paths:
       - 'src/**'
       - 'pom.xml'
+      - '.mvn/**'
+      - 'mvnw'
       - 'Dockerfile'
+      - '.dockerignore'
       - '.github/workflows/backend-ci.yml'
-
-  # Manual trigger — works from any branch via GitHub UI → Actions → Run workflow
+  pull_request:
+    branches: [ master ]
   workflow_dispatch:
 
+env:
+  # GHCR image names must be lowercase.
+  IMAGE: ghcr.io/${{ vars.IMAGE_NAMESPACE || 'grassroots-worker-rights' }}/ai-labor-rights-backend
+
 jobs:
-  release:
-    name: Version, Tag & Release
+  test:
+    name: Test
     runs-on: ubuntu-latest
-
     permissions:
-      contents: write   # Required to create tags and GitHub releases
-      packages: write   # Required to push to ghcr.io
-
-    outputs:
-      version: ${{ steps.semver.outputs.nextStrict }}
-      should_release: ${{ steps.check.outputs.should_release }}
-
+      contents: read
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Full history required for semver calculation
+      - uses: actions/checkout@v4
 
-      # Calculates the next version from conventional commits since the last tag.
-      # Commit prefixes:
-      #   feat / feature   → minor bump  (1.0.0 → 1.1.0)
-      #   fix / bugfix     → patch bump  (1.0.0 → 1.0.1)
-      #   Custom major:    add "major:" to majorList for a major bump (1.0.0 → 2.0.0)
-      # noVersionBumpBehavior: current → returns current version silently if no bumpable commits
-      - name: Calculate next semantic version
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Run tests
+        run: ./mvnw -B test
+
+  publish:
+    name: Build & push image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.event_name != 'pull_request'
+    # One publish at a time per branch; on master this also stops two runs computing the same version.
+    concurrency:
+      group: backend-publish-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write   # git tag + GitHub Release (master only)
+      packages: write   # push to GHCR
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect build kind
+        id: kind
+        run: |
+          if [ "$GITHUB_REF" = "refs/heads/master" ]; then
+            echo "default_branch=true" >> "$GITHUB_OUTPUT"
+          else
+            # Docker tags allow [A-Za-z0-9_.-]; anything else (e.g. "/") becomes "-".
+            branch=$(printf '%s' "$GITHUB_REF_NAME" | tr -c 'A-Za-z0-9_.-' '-' | cut -c1-60)
+            echo "default_branch=false" >> "$GITHUB_OUTPUT"
+            echo "dev_tag=dev-$branch" >> "$GITHUB_OUTPUT"
+            echo "dev_tag_sha=dev-$branch-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # semver-action needs an existing vX.Y.Z tag to compare against (a fallbackTag that doesn't
+      # exist as a real git tag fails with a 404), so the very first release is bootstrapped here.
+      - name: Find latest version tag
+        id: last
+        if: steps.kind.outputs.default_branch == 'true'
+        run: |
+          if latest=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null); then
+            echo "Latest version tag: $latest"
+            echo "first=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "No vX.Y.Z tag yet — this run creates the first release, v0.1.0."
+            echo "first=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # feat → minor, fix/perf/refactor → patch, "major:"/"breaking:" → major.
+      # "current" behaviour returns the current version when nothing bumps it (no release then).
+      - name: Calculate next version
         id: semver
+        if: steps.kind.outputs.default_branch == 'true' && steps.last.outputs.first == 'false'
         uses: ietf-tools/semver-action@v1
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          branch: ${{ github.ref_name }}
+          token: ${{ github.token }}
+          branch: master
           majorList: major, breaking
           minorList: feat, feature
           patchList: fix, bugfix, perf, refactor
-          noVersionBumpBehavior: warn
-          noNewCommitBehavior: warn
+          noVersionBumpBehavior: current
+          noNewCommitBehavior: current
 
-      # Only create a release if the version actually changed
-      - name: Check if version bumped
-        id: check
+      - name: Decide whether to release
+        id: release
+        if: steps.kind.outputs.default_branch == 'true'
+        env:
+          FIRST: ${{ steps.last.outputs.first }}
+          CURRENT: ${{ steps.semver.outputs.current }}
+          NEXT: ${{ steps.semver.outputs.next }}
+          NEXT_STRICT: ${{ steps.semver.outputs.nextStrict }}
         run: |
-          if [ "${{ steps.semver.outputs.current }}" != "${{ steps.semver.outputs.next }}" ]; then
-            echo "should_release=true" >> $GITHUB_OUTPUT
+          if [ "$FIRST" = "true" ]; then
+            NEXT_STRICT=0.1.0
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "tag=v$NEXT_STRICT" >> "$GITHUB_OUTPUT"
+            echo "First release: v$NEXT_STRICT"
+          elif [ -n "$NEXT_STRICT" ] && [ "$CURRENT" != "$NEXT" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "tag=v$NEXT_STRICT" >> "$GITHUB_OUTPUT"
+            echo "Releasing v$NEXT_STRICT"
           else
-            echo "should_release=false" >> $GITHUB_OUTPUT
-            echo "No version bump — skipping release and Docker build."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "No version bump — publishing sha tag only."
           fi
 
-      - name: Create Git tag
-        if: steps.check.outputs.should_release == 'true'
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag v${{ steps.semver.outputs.nextStrict }}
-          git push origin v${{ steps.semver.outputs.nextStrict }}
+      - uses: docker/setup-buildx-action@v3
 
-      # Creates a GitHub Release with auto-generated notes from commit messages
-      - name: Create GitHub Release
-        if: steps.check.outputs.should_release == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ steps.semver.outputs.nextStrict }}
-          name: v${{ steps.semver.outputs.nextStrict }}
-          generate_release_notes: true
-
-  docker-build:
-    name: Build & Push Docker Image
-    runs-on: ubuntu-latest
-    needs: release
-    if: needs.release.outputs.should_release == 'true'
-
-    permissions:
-      contents: read
-      packages: write
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      # GITHUB_TOKEN is provided automatically — no secrets to configure
-      - name: Log in to GitHub Container Registry (ghcr.io)
+      # GITHUB_TOKEN can push only if this repo belongs to the IMAGE_NAMESPACE org. Otherwise add a
+      # GHCR_TOKEN secret (classic PAT with write:packages, from an org member).
+      - name: Log in to GHCR
         uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          password: ${{ secrets.GHCR_TOKEN || github.token }}
 
-      - name: Extract Docker metadata
+      - name: Image metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
-          images: ghcr.io/${{ github.repository_owner }}/ai-labor-rights-backend
+          images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=v${{ needs.release.outputs.version }}
-            type=sha,prefix=,format=short
+            type=sha,format=short,enable=${{ steps.kind.outputs.default_branch == 'true' }}
+            type=raw,value=${{ steps.release.outputs.tag }},enable=${{ steps.release.outputs.enabled == 'true' }}
+            type=raw,value=latest,enable=${{ steps.release.outputs.enabled == 'true' }}
+            type=raw,value=${{ steps.kind.outputs.dev_tag_sha }},enable=${{ steps.kind.outputs.default_branch != 'true' }}
+            type=raw,value=${{ steps.kind.outputs.dev_tag }},enable=${{ steps.kind.outputs.default_branch != 'true' }}
 
-      - name: Build and push Docker image
+      - name: Build & push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=backend
+          cache-to: type=gha,scope=backend,mode=max
+
+      - name: Summary
+        env:
+          TAGS: ${{ steps.meta.outputs.tags }}
+          IS_MAIN: ${{ steps.kind.outputs.default_branch }}
+        run: |
+          {
+            if [ "$IS_MAIN" = "true" ]; then echo "### Image pushed"; else echo "### TEST image pushed (not prod-ready)"; fi
+            printf '%s\n' "$TAGS" | sed 's/^/- `/; s/$/`/'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create git tag
+        if: steps.release.outputs.enabled == 'true'
+        env:
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "$TAG"
+          git push origin "$TAG"
+
+      - name: Create GitHub Release
+        if: steps.release.outputs.enabled == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.release.outputs.tag }}
+          name: ${{ steps.release.outputs.tag }}
+          generate_release_notes: true
