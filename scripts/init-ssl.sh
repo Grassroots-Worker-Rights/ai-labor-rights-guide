@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # init-ssl.sh — First-run Let's Encrypt setup for the production stack.
 #
-# Issues ONE certificate (named after $DOMAIN) covering $DOMAIN and, if set, $STAGE_DOMAIN. Prod's
+# Issues ONE certificate (named after $DOMAIN) covering $DOMAIN, www.$DOMAIN and, if set, $STAGE_DOMAIN. Prod's
 # nginx serves both sites with it. Run ONCE on the server, from /opt/apps/ai-labor-rights (the deploy
 # workflow copies this script to scripts/ there):
 #   bash scripts/init-ssl.sh
@@ -35,7 +35,7 @@ if [ -z "$EMAIL" ]; then
 fi
 
 STAGE_DOMAIN="${STAGE_DOMAIN:-}"
-DOMAIN_ARGS="-d $DOMAIN${STAGE_DOMAIN:+ -d $STAGE_DOMAIN}"
+DOMAIN_ARGS="-d $DOMAIN -d www.$DOMAIN${STAGE_DOMAIN:+ -d $STAGE_DOMAIN}"
 
 COMPOSE="docker compose -f docker-compose.prod.yml --env-file .env"
 

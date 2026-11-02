@@ -96,7 +96,7 @@ Docker network `ai-labor-rights-edge`. Stage has no nginx, certbot or ports of i
      cd /opt/apps/ai-labor-rights
      C="docker compose -f docker-compose.prod.yml --env-file .env"
      $C run --rm --entrypoint certbot certbot certonly --webroot -w /var/www/certbot \
-       --cert-name ergasiakos-odigos.gr -d ergasiakos-odigos.gr -d stage.ergasiakos-odigos.gr \
+       --cert-name ergasiakos-odigos.gr -d ergasiakos-odigos.gr -d www.ergasiakos-odigos.gr -d stage.ergasiakos-odigos.gr \
        --expand --non-interactive --agree-tos -m <EMAIL>
      $C exec nginx nginx -s reload
      ```
