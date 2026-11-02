@@ -109,9 +109,14 @@ services:
     depends_on: [backend, frontend]
     restart: unless-stopped
     mem_limit: 192m  # proxy + small disk cache (cache lives on disk, not RAM)
-    # Reload nginx every 6 h to pick up renewed certs (certbot renews every 12 h)
-    command: >
-      /bin/sh -c "while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g 'daemon off;'"
+    # Reload nginx every 6 h to pick up renewed certs (certbot renews every 12 h).
+    # nginx must be started via /docker-entrypoint.sh with "nginx" as the command: only then does the
+    # image render nginx/templates/*.template into conf.d. A plain `command: sh -c "... nginx ..."`
+    # skips that step and nginx comes up with its stock config (no HTTPS).
+    entrypoint:
+      - /bin/sh
+      - -c
+      - (while :; do sleep 6h; nginx -s reload; done) & exec /docker-entrypoint.sh nginx -g 'daemon off;'
 
   # The only certbot on the server: it renews the single certificate that covers both domains.
   certbot:
