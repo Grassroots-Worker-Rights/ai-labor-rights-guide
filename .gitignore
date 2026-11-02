@@ -37,3 +37,8 @@ build/
 .vscode/
 
 CLAUDE.md
+
+# Local secrets — never commit. .env.example is the committed template (empty values only).
+.env
+.env.*
+!.env.example

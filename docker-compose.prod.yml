@@ -1,14 +1,23 @@
 name: ai-labor-rights-prod
 
-# Production stack: Meilisearch + Spring backend + Angular frontend + nginx + Let's Encrypt.
-# All services on an internal network; only nginx (80/443) is reachable externally.
+# Production stack (image-based): Meilisearch + Chroma + Spring backend + Angular frontend + nginx +
+# Let's Encrypt. Deployed by .github/workflows/deploy.yml — the file is copied to
+# /opt/apps/ai-labor-rights on the server; there is no git checkout there. See docs/CICD.md.
 #
-# Prerequisites:
-#   1. cp .env.example .env   # fill DEEPSEEK_API_KEY, MEILI_MASTER_KEY, DOMAIN, EMAIL
-#   2. bash scripts/init-ssl.sh    # one-time Let's Encrypt bootstrap
-#   3. docker compose -f docker-compose.prod.yml up -d
-#   4. docker compose -f docker-compose.prod.yml exec backend \
-#        sh -c 'wget -qO- --post-data= http://localhost:8080/api/admin/ingest'   # index content
+# This stack's nginx is the server's ONLY public entry point (80/443). It terminates TLS for both
+# ${DOMAIN} and ${STAGE_DOMAIN} (one certificate covering both names) and forwards stage traffic to
+# the stage stack over the shared "ai-labor-rights-edge" network.
+#
+# Server-side (persistent, not shipped by CI): .env, models/, certbot/.
+# Shipped by CI: this file, nginx/templates/, scripts/init-ssl.sh.
+#
+# Manual use on the server:
+#   export BACKEND_IMAGE_TAG=v1.2.3 FRONTEND_IMAGE_TAG=v1.2.3   # default: latest
+#   docker compose -f docker-compose.prod.yml --env-file .env up -d
+
+x-images:
+  backend: &backend-image ghcr.io/${IMAGE_NAMESPACE:-grassroots-worker-rights}/ai-labor-rights-backend:${BACKEND_IMAGE_TAG:-latest}
+  frontend: &frontend-image ghcr.io/${IMAGE_NAMESPACE:-grassroots-worker-rights}/ai-labor-rights-frontend:${FRONTEND_IMAGE_TAG:-latest}
 
 services:
   meilisearch:
@@ -20,8 +29,8 @@ services:
       - meili_data:/meili_data
     networks: [internal]
     restart: unless-stopped
-    # Memory budget for the 8 GB box (see backend note). Meili memory-maps its index; the cap is a
-    # safety ceiling, not a target — the OS page cache (reclaimable) handles the hot index pages.
+    # Meili memory-maps its index; the cap is a safety ceiling, not a target — the OS page cache
+    # (reclaimable) handles the hot index pages.
     mem_limit: 2g
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:7700/health"]
@@ -30,8 +39,7 @@ services:
       retries: 5
 
   # ChromaDB — alternative chat-RAG backend (APP_RAG_PROVIDER=chroma). Run alongside Meili for the
-  # trial so ingestion populates both and the env var can flip live; post-trial drop the loser and
-  # reclaim ~1 GB. Internal network only — never exposed.
+  # trial so ingestion populates both and the env var can flip live. Internal network only.
   chromadb:
     image: chromadb/chroma:0.6.3
     environment:
@@ -42,7 +50,6 @@ services:
     networks: [internal]
     restart: unless-stopped
     mem_limit: 1g
-    # Informational (backend waits for start, not health). v2 heartbeat path is for Chroma 0.5+/0.6.
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v2/heartbeat')"]
       interval: 10s
@@ -50,7 +57,7 @@ services:
       retries: 5
 
   backend:
-    build: .
+    image: *backend-image
     environment:
       DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY}
       MEILISEARCH_URL: http://meilisearch:7700
@@ -59,11 +66,12 @@ services:
       CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-}
       # Chat RAG backend: meili (default) | chroma. The /api/search box stays on Meili regardless.
       APP_RAG_PROVIDER: ${APP_RAG_PROVIDER:-meili}
+      APP_RATELIMIT_ENABLED: ${APP_RATELIMIT_ENABLED:-true}
       CHROMA_HOST: http://chromadb
       CHROMA_PORT: "8000"
     volumes:
-      # Local ONNX embedding model (read-only). If ./models is empty the app downloads it at startup
-      # (the VPS has internet); behind a proxy, fetch it first with scripts/fetch-embedding-model.*.
+      # Local ONNX embedding model (read-only), shared with stage. If ./models is empty the app
+      # downloads it at startup.
       - ./models:/app/models:ro
     depends_on:
       meilisearch:
@@ -72,15 +80,11 @@ services:
         condition: service_started
     networks: [internal]
     restart: unless-stopped
-    # 8 GB box budget (trial runs BOTH vector engines): ~1 GB OS/page-cache, 2 GB Meili, 1 GB Chroma,
-    # 2.5 GB backend, ~0.25 GB the two nginx + certbot — ~1.25 GB headroom. With mem_limit set, the
-    # JVM's MaxRAMPercentage=60 (Dockerfile) resolves heap against THIS limit (~1.5 GB heap), not the
-    # host's 8 GB; the remaining ~1 GB covers the ONNX embedder's off-heap native memory + metaspace.
+    # JVM heap is 60% of this limit (Dockerfile); the rest covers the ONNX embedder's off-heap memory.
     mem_limit: 2560m
 
   frontend:
-    build:
-      context: ../Angular-frontend
+    image: *frontend-image
     networks: [internal]
     depends_on: [backend]
     restart: unless-stopped
@@ -93,12 +97,15 @@ services:
       - "443:443"
     environment:
       DOMAIN: ${DOMAIN}
-      NGINX_ENVSUBST_TEMPLATE_VARS: DOMAIN   # only substitute $DOMAIN, leave $host etc. alone
+      STAGE_DOMAIN: ${STAGE_DOMAIN:?Set STAGE_DOMAIN in .env (e.g. stage.example.org)}
+      # Only substitute these; leave nginx's own $host, $uri, ... alone.
+      NGINX_ENVSUBST_TEMPLATE_VARS: DOMAIN STAGE_DOMAIN
     volumes:
       - ./nginx/templates:/etc/nginx/templates:ro
       - ./certbot/conf:/etc/letsencrypt:ro
       - ./certbot/www:/var/www/certbot:ro
-    networks: [internal]
+    # internal → prod backend/frontend; edge → stage-backend/stage-frontend.
+    networks: [internal, edge]
     depends_on: [backend, frontend]
     restart: unless-stopped
     mem_limit: 192m  # proxy + small disk cache (cache lives on disk, not RAM)
@@ -106,6 +113,7 @@ services:
     command: >
       /bin/sh -c "while :; do sleep 6h & wait $${!}; nginx -s reload; done & nginx -g 'daemon off;'"
 
+  # The only certbot on the server: it renews the single certificate that covers both domains.
   certbot:
     image: certbot/certbot
     volumes:
@@ -120,6 +128,11 @@ services:
 networks:
   internal:
     driver: bridge
+  # Shared with the stage stack. Created by the deploy workflow / init-ssl.sh:
+  #   docker network create ai-labor-rights-edge
+  edge:
+    name: ai-labor-rights-edge
+    external: true
 
 volumes:
   meili_data:

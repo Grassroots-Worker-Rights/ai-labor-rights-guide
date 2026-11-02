@@ -1,11 +1,12 @@
 # nginx config — processed by envsubst on container start.
-# Only ${DOMAIN} is substituted; nginx variables ($host, $uri, etc.) are left as-is.
+# Only ${DOMAIN} and ${STAGE_DOMAIN} are substituted; nginx variables ($host, $uri, etc.) are left as-is.
+# The stage site lives in stage.conf.template.
 
-# ── HTTP: ACME challenge + redirect to HTTPS ────────────────────────────
+# ── HTTP: ACME challenge + redirect to HTTPS (prod + stage) ─────────────
 server {
     listen 80;
     listen [::]:80;
-    server_name ${DOMAIN};
+    server_name ${DOMAIN} ${STAGE_DOMAIN};
     access_log off;
 
     location /.well-known/acme-challenge/ {

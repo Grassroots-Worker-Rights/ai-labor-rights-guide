@@ -1,0 +1,78 @@
+# Stage site — served by the PROD nginx, proxied to the stage compose project over the shared
+# "ai-labor-rights-edge" network. Processed by envsubst like app.conf.template.
+#
+# TLS: the same certificate as prod (live/${DOMAIN}), issued for both ${DOMAIN} and ${STAGE_DOMAIN}.
+#
+# Upstreams are resolved at request time (resolver + variables), so prod nginx starts and keeps
+# running even when the stage stack is down or being redeployed — stage just answers 502 meanwhile.
+# No wiki proxy cache here: stage should always show freshly deployed content.
+
+server {
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name ${STAGE_DOMAIN};
+
+    # Privacy: do not record visitor IPs or browsed URLs in nginx access logs (same as prod).
+    access_log off;
+
+    ssl_certificate     /etc/letsencrypt/live/${DOMAIN}/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/${DOMAIN}/privkey.pem;
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+
+    # Docker's embedded DNS.
+    resolver 127.0.0.11 valid=10s ipv6=off;
+    set $stage_backend  http://stage-backend:8080;
+    set $stage_frontend http://stage-frontend:80;
+
+    # Security headers (inherited by every location below — none of them sets its own add_header).
+    add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+    add_header X-Frame-Options DENY always;
+    add_header X-Content-Type-Options nosniff always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "same-origin" always;
+    # Keep stage out of search engines.
+    add_header X-Robots-Tag "noindex, nofollow" always;
+
+    gzip              on;
+    gzip_vary         on;
+    gzip_proxied      any;
+    gzip_comp_level   5;
+    gzip_min_length   256;
+    gzip_types        text/plain text/css application/json application/javascript
+                      application/xml text/markdown image/svg+xml;
+
+    # Admin endpoints (ingestion) — never exposed publicly.
+    location /api/admin/ {
+        deny all;
+    }
+
+    location /api/ {
+        proxy_pass          $stage_backend;
+        proxy_http_version  1.1;
+        proxy_set_header    Host              $host;
+        proxy_set_header    X-Real-IP         $remote_addr;
+        proxy_set_header    X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header    X-Forwarded-Proto $scheme;
+        proxy_read_timeout  200s;   # multi-step LLM turns can be slow
+    }
+
+    # Dynamic XML sitemap (not cached on stage).
+    location = /sitemap.xml {
+        proxy_pass          $stage_backend;
+        proxy_http_version  1.1;
+        proxy_set_header    Host              $host;
+        proxy_set_header    X-Real-IP         $remote_addr;
+        proxy_set_header    X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header    X-Forwarded-Proto $scheme;
+    }
+
+    # Angular SPA (frontend nginx also routes social bots on /wiki/* to the backend).
+    location / {
+        proxy_pass       $stage_frontend;
+        proxy_set_header Host              $host;
+        proxy_set_header User-Agent        $http_user_agent;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
