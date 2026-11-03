@@ -123,7 +123,11 @@ Docker network `ai-labor-rights-edge`. Stage has no nginx, certbot or ports of i
 
 ## Gotchas
 
-- **Memory:** both stacks share one box. Prod caps ≈ 6.0 GB (Meili 2 G, Chroma 1 G, backend 2.5 G,
+- **Chroma is off by default.** `chromadb` sits behind the compose profile `chroma`; deploys don't
+  start it (and stop it if it's running). Its volume and config are kept. To turn it on: add
+  `COMPOSE_PROFILES=chroma` to `.env` / `.env.stage`, redeploy, run the ingest, then set
+  `APP_RAG_PROVIDER=chroma` if the chat should use it. Remove the line to turn it off again.
+- **Memory:** both stacks share one box. Prod caps ≈ 6.0 GB (Meili 2 G, Chroma 1 G if enabled, backend 2.5 G,
   nginx/frontend/certbot ≈ 0.45 G), stage ≈ 2.7 GB. Check `free -h` on the server; on 8 GB, lower the
   limits or stop stage when you don't need it (`docker compose -f docker-compose.stage.yml --env-file .env.stage down`).
 - **nginx changes ship only with a prod deploy**, including `stage.conf.template`, because prod's nginx

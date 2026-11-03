@@ -45,6 +45,10 @@ services:
     # with 400, so ingest skipped Chroma). Persists to /data by default; ALLOW_RESET stays off.
     # New volume: 0.6 and 1.x storage formats differ; contents are rebuilt by /api/admin/ingest.
     image: chromadb/chroma:1.5.9
+    # Off by default (the chat uses Meili; nothing queries Chroma). To run it, set
+    # COMPOSE_PROFILES=chroma in the env file, redeploy, then re-run /api/admin/ingest. Needed before
+    # switching APP_RAG_PROVIDER=chroma.
+    profiles: [chroma]
     volumes:
       - chroma_v1_data:/data
     networks: [internal]
@@ -79,6 +83,7 @@ services:
         condition: service_healthy
       chromadb:
         condition: service_started
+        required: false  # optional: the backend boots without Chroma (lazy bean, ingest skips it)
     networks: [internal]
     restart: unless-stopped
     # JVM heap is 60% of this limit (Dockerfile); the rest covers the ONNX embedder's off-heap memory.

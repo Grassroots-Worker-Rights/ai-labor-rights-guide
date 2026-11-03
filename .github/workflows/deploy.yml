@@ -133,6 +133,11 @@ jobs:
 
             $COMPOSE pull
             $COMPOSE up -d --remove-orphans
+            # Chroma is opt-in (COMPOSE_PROFILES=chroma in the env file). `up` never stops a container
+            # whose profile is off, so stop/remove it here; its volume (the index) is kept.
+            if ! $COMPOSE config --services | grep -qx chromadb; then
+              $COMPOSE rm -sf chromadb
+            fi
 
             if [ "$DEPLOY_ENV" = "prod" ]; then
               # Re-render the nginx templates and re-resolve the recreated backend/frontend IPs.
