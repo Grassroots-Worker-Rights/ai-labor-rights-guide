@@ -41,17 +41,18 @@ services:
   # ChromaDB — alternative chat-RAG backend (APP_RAG_PROVIDER=chroma). Run alongside Meili for the
   # trial so ingestion populates both and the env var can flip live. Internal network only.
   chromadb:
-    image: chromadb/chroma:0.6.3
-    environment:
-      IS_PERSISTENT: "TRUE"
-      # ALLOW_RESET deliberately OFF in prod — the reset endpoint can wipe the vector store.
+    # 1.x: the Chroma v2 API that Spring AI 2.0's client expects (0.6.3 answered its collection lookup
+    # with 400, so ingest skipped Chroma). Persists to /data by default; ALLOW_RESET stays off.
+    # New volume: 0.6 and 1.x storage formats differ; contents are rebuilt by /api/admin/ingest.
+    image: chromadb/chroma:1.5.9
     volumes:
-      - chroma_data:/chroma/chroma
+      - chroma_v1_data:/data
     networks: [internal]
     restart: unless-stopped
     mem_limit: 1g
+    # The 1.x image has no python/curl/wget; probe the heartbeat with bash's /dev/tcp instead.
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v2/heartbeat')"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8000 && printf 'GET /api/v2/heartbeat HTTP/1.0\\r\\n\\r\\n' >&3 && head -1 <&3 | grep -q ' 200 '"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -141,4 +142,4 @@ networks:
 
 volumes:
   meili_data:
-  chroma_data:
+  chroma_v1_data:
