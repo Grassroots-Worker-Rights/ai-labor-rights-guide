@@ -1,0 +1,4 @@
+# Spring Boot 4 loads EnvironmentPostProcessors from spring.factories under this key (the old
+# META-INF/spring/org.springframework.boot.env.EnvironmentPostProcessor.imports file is not read).
+org.springframework.boot.EnvironmentPostProcessor=\
+com.angeasla.ai_labor_rights_guide.config.EmbeddingModelLocationPostProcessor
